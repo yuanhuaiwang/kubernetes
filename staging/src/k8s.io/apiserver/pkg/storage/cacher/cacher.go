@@ -384,7 +384,9 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 			}, time.Second, stopCh,
 		)
 	}()
-
+	
+	objectType := objType.String()
+	watchCacheCapacity.WithLabelValues(objectType).Set(float64(cacher.watchCache.capacity))
 	return cacher, nil
 }
 
