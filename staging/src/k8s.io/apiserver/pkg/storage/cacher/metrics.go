@@ -56,12 +56,21 @@ var (
 		},
 		[]string{"resource"},
 	)
+
+	watchCacheCapacity = metrics.NewGaugeVec(
+		&metrics.GaugeOpts{
+			Name: "watch_cache_capacity",
+			Help: "number of watch cache capacity broken by resource type.",
+		},
+		[]string{"resource"},
+	)
 )
 
 func init() {
 	legacyregistry.MustRegister(initCounter)
 	legacyregistry.MustRegister(watchCacheCapacityIncreaseTotal)
 	legacyregistry.MustRegister(watchCacheCapacityDecreaseTotal)
+	legacyregistry.MustRegister(watchCacheCapacity)
 }
 
 // recordsWatchCacheCapacityChange record watchCache capacity resize(increase or decrease) operations.
@@ -71,4 +80,5 @@ func recordsWatchCacheCapacityChange(objType string, old, new int) {
 		return
 	}
 	watchCacheCapacityDecreaseTotal.WithLabelValues(objType).Inc()
+	watchCacheCapacity.WithLabelValues(objType).Set(float64(new))
 }
