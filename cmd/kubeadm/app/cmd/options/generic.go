@@ -17,11 +17,12 @@ limitations under the License.
 package options
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/spf13/pflag"
+
 	cliflag "k8s.io/component-base/cli/flag"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/features"
 )
@@ -53,6 +54,9 @@ func AddIgnorePreflightErrorsFlag(fs *pflag.FlagSet, ignorePreflightErrors *[]st
 
 // AddControlPlanExtraArgsFlags adds the ExtraArgs flags for control plane components
 func AddControlPlanExtraArgsFlags(fs *pflag.FlagSet, apiServerExtraArgs, controllerManagerExtraArgs, schedulerExtraArgs *map[string]string) {
+	// TODO: https://github.com/kubernetes/kubeadm/issues/1601
+	// Either deprecate these flags or handle duplicate keys.
+	// Currently the map[string]string returned by NewMapStringString() doesn't allow this.
 	fs.Var(cliflag.NewMapStringString(apiServerExtraArgs), APIServerExtraArgs, "A set of extra flags to pass to the API Server or override default ones in form of <flagname>=<value>")
 	fs.Var(cliflag.NewMapStringString(controllerManagerExtraArgs), ControllerManagerExtraArgs, "A set of extra flags to pass to the Controller Manager or override default ones in form of <flagname>=<value>")
 	fs.Var(cliflag.NewMapStringString(schedulerExtraArgs), SchedulerExtraArgs, "A set of extra flags to pass to the Scheduler or override default ones in form of <flagname>=<value>")
@@ -90,20 +94,15 @@ func AddKubeadmOtherFlags(flagSet *pflag.FlagSet, rootfsPath *string) {
 	)
 }
 
-// AddKustomizePodsFlag adds the --kustomize flag to the given flagset
-func AddKustomizePodsFlag(fs *pflag.FlagSet, kustomizeDir *string) {
-	fs.StringVarP(kustomizeDir, Kustomize, "k", *kustomizeDir, "The path where kustomize patches for static pod manifests are stored.")
-	fs.MarkDeprecated(Kustomize, fmt.Sprintf("This flag is deprecated and will be removed in a future version. Please use %s instead.", Patches))
-}
-
 // AddPatchesFlag adds the --patches flag to the given flagset
 func AddPatchesFlag(fs *pflag.FlagSet, patchesDir *string) {
-	fs.StringVar(patchesDir, Patches, *patchesDir, `Path to a directory that contains files named `+
-		`"target[suffix][+patchtype].extension". For example, `+
-		`"kube-apiserver0+merge.yaml" or just "etcd.json". `+
-		`"patchtype" can be one of "strategic", "merge" or "json" and they match the patch formats `+
-		`supported by kubectl. The default "patchtype" is "strategic". "extension" must be either `+
-		`"json" or "yaml". "suffix" is an optional string that can be used to determine `+
-		`which patches are applied first alpha-numerically.`,
-	)
+	const usage = `Path to a directory that contains files named ` +
+		`"target[suffix][+patchtype].extension". For example, ` +
+		`"kube-apiserver0+merge.yaml" or just "etcd.json". ` +
+		`"target" can be one of "kube-apiserver", "kube-controller-manager", "kube-scheduler", "etcd", "kubeletconfiguration". ` +
+		`"patchtype" can be one of "strategic", "merge" or "json" and they match the patch formats ` +
+		`supported by kubectl. The default "patchtype" is "strategic". "extension" must be either ` +
+		`"json" or "yaml". "suffix" is an optional string that can be used to determine ` +
+		`which patches are applied first alpha-numerically.`
+	fs.StringVar(patchesDir, Patches, *patchesDir, usage)
 }

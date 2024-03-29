@@ -19,12 +19,13 @@ import (
 
 	// TODO(rjnagal): Remove dependency after moving all stats structs from v1.
 	// using v1 now for easy conversion.
-	"github.com/google/cadvisor/info/v1"
+	v1 "github.com/google/cadvisor/info/v1"
 )
 
 const (
 	TypeName   = "name"
 	TypeDocker = "docker"
+	TypePodman = "podman"
 )
 
 type CpuSpec struct {
@@ -263,9 +264,9 @@ type FsInfo struct {
 }
 
 type RequestOptions struct {
-	// Type of container identifier specified - "name", "dockerid", dockeralias"
+	// Type of container identifier specified - TypeName (default) or TypeDocker
 	IdType string `json:"type"`
-	// Number of stats to return
+	// Number of stats to return, -1 means no limit.
 	Count int `json:"count"`
 	// Whether to include stats for child subcontainers.
 	Recursive bool `json:"recursive"`

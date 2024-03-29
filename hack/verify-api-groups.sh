@@ -69,7 +69,7 @@ groups_without_codegen=(
 	"imagepolicy"
 	"admission"
 )
-client_gen_file="${KUBE_ROOT}/vendor/k8s.io/code-generator/cmd/client-gen/main.go"
+client_gen_file="${KUBE_ROOT}/staging/src/k8s.io/code-generator/cmd/client-gen/main.go"
 
 for group_dirname in "${group_dirnames[@]}"; do
 	if ! grep -q "${group_dirname}/" "${client_gen_file}" ; then
@@ -92,10 +92,11 @@ done
 packages_without_install=(
 	"k8s.io/kubernetes/pkg/apis/abac"
 	"k8s.io/kubernetes/pkg/apis/admission"
+	"k8s.io/kubernetes/pkg/apis/apidiscovery"
 	"k8s.io/kubernetes/pkg/apis/componentconfig" # TODO: Remove this package completely and from this list
 )
 known_version_files=(
-	"pkg/master/import_known_versions.go"
+	"pkg/controlplane/import_known_versions.go"
 )
 for expected_install_package in "${expected_install_packages[@]}"; do
 	found=0

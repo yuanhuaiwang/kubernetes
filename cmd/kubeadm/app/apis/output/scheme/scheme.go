@@ -22,8 +22,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/output"
-	"k8s.io/kubernetes/cmd/kubeadm/app/apis/output/v1alpha1"
+	"k8s.io/kubernetes/cmd/kubeadm/app/apis/output/v1alpha2"
+	"k8s.io/kubernetes/cmd/kubeadm/app/apis/output/v1alpha3"
 )
 
 // Scheme is the runtime.Scheme to which all kubeadm api types are registered.
@@ -40,6 +42,7 @@ func init() {
 // AddToScheme builds the kubeadm scheme using all known versions of the kubeadm api.
 func AddToScheme(scheme *runtime.Scheme) {
 	utilruntime.Must(output.AddToScheme(scheme))
-	utilruntime.Must(v1alpha1.AddToScheme(scheme))
-	utilruntime.Must(scheme.SetVersionPriority(v1alpha1.SchemeGroupVersion))
+	utilruntime.Must(v1alpha2.AddToScheme(scheme))
+	utilruntime.Must(v1alpha3.AddToScheme(scheme))
+	utilruntime.Must(scheme.SetVersionPriority(v1alpha3.SchemeGroupVersion, v1alpha2.SchemeGroupVersion))
 }

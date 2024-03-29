@@ -20,10 +20,12 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
+
+	utilsexec "k8s.io/utils/exec"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	"k8s.io/kubernetes/cmd/kubeadm/app/preflight"
-	utilsexec "k8s.io/utils/exec"
 )
 
 // NewPreflightPhase creates a kubeadm workflow phase that implements preflight checks for a new node join
@@ -58,7 +60,7 @@ func runPreflight(c workflow.RunData) error {
 			fmt.Println("[preflight] Pulling images required for setting up a Kubernetes cluster")
 			fmt.Println("[preflight] This might take a minute or two, depending on the speed of your internet connection")
 			fmt.Println("[preflight] You can also perform this action in beforehand using 'kubeadm config images pull'")
-			if err := preflight.RunPullImagesCheck(utilsexec.New(), data.Cfg(), data.IgnorePreflightErrors()); err != nil {
+			if err := preflight.RunPullImagesCheck(utilsexec.New(), data.InitCfg(), data.IgnorePreflightErrors()); err != nil {
 				return err
 			}
 		} else {

@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
-	"k8s.io/utils/mount"
+	"k8s.io/mount-utils"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -146,7 +146,7 @@ func (attacher *rbdAttacher) GetDeviceMountPath(spec *volume.Spec) (string, erro
 // MountDevice implements Attacher.MountDevice. It is called by the kubelet to
 // mount device at the given mount path.
 // This method is idempotent, callers are responsible for retrying on failure.
-func (attacher *rbdAttacher) MountDevice(spec *volume.Spec, devicePath string, deviceMountPath string) error {
+func (attacher *rbdAttacher) MountDevice(spec *volume.Spec, devicePath string, deviceMountPath string, mountArgs volume.DeviceMounterArgs) error {
 	klog.V(4).Infof("rbd: mouting device %s to %s", devicePath, deviceMountPath)
 	notMnt, err := attacher.mounter.IsLikelyNotMountPoint(deviceMountPath)
 	if err != nil {
@@ -174,7 +174,11 @@ func (attacher *rbdAttacher) MountDevice(spec *volume.Spec, devicePath string, d
 	if ro {
 		options = append(options, "ro")
 	}
+	if mountArgs.SELinuxLabel != "" {
+		options = volutil.AddSELinuxMountOption(options, mountArgs.SELinuxLabel)
+	}
 	mountOptions := volutil.MountOptionFromSpec(spec, options...)
+
 	err = attacher.mounter.FormatAndMount(devicePath, deviceMountPath, fstype, mountOptions)
 	if err != nil {
 		os.Remove(deviceMountPath)
@@ -199,15 +203,16 @@ var _ volume.DeviceUnmounter = &rbdDetacher{}
 // mount of the RBD image. This is called once all bind mounts have been
 // unmounted.
 // Internally, it does four things:
-//  - Unmount device from deviceMountPath.
-//  - Detach device from the node.
-//  - Remove lock if found. (No need to check volume readonly or not, because
-//  device is not on the node anymore, it's safe to remove lock.)
-//  - Remove the deviceMountPath at last.
+//   - Unmount device from deviceMountPath.
+//   - Detach device from the node.
+//   - Remove lock if found. (No need to check volume readonly or not, because
+//     device is not on the node anymore, it's safe to remove lock.)
+//   - Remove the deviceMountPath at last.
+//
 // This method is idempotent, callers are responsible for retrying on failure.
 func (detacher *rbdDetacher) UnmountDevice(deviceMountPath string) error {
 	if pathExists, pathErr := mount.PathExists(deviceMountPath); pathErr != nil {
-		return fmt.Errorf("Error checking if path exists: %v", pathErr)
+		return fmt.Errorf("error checking if path exists: %v", pathErr)
 	} else if !pathExists {
 		klog.Warningf("Warning: Unmount skipped because path does not exist: %v", deviceMountPath)
 		return nil
@@ -226,7 +231,7 @@ func (detacher *rbdDetacher) UnmountDevice(deviceMountPath string) error {
 		if err = detacher.mounter.Unmount(deviceMountPath); err != nil {
 			return err
 		}
-		klog.V(3).Infof("rbd: successfully umount device mountpath %s", deviceMountPath)
+		klog.V(3).Infof("rbd: successfully unmount device mountpath %s", deviceMountPath)
 	}
 
 	// Get devicePath from deviceMountPath if devicePath is empty

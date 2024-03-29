@@ -17,13 +17,15 @@ limitations under the License.
 package util
 
 import (
-	"errors"
 	"fmt"
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"path"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pkg/errors"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 func TestEmptyVersion(t *testing.T) {
@@ -48,6 +50,7 @@ func TestValidVersion(t *testing.T) {
 		"v1.5.0-alpha.0.1078+1044b6822497da-pull",
 		"v1.5.0-alpha.1.822+49b9e32fad9f32-pull-gke-gci",
 		"v1.6.1+coreos.0",
+		"1.7.1",
 	}
 	for _, s := range validVersions {
 		t.Run(s, func(t *testing.T) {
@@ -56,7 +59,7 @@ func TestValidVersion(t *testing.T) {
 			if err != nil {
 				t.Errorf("KubernetesReleaseVersion unexpected error for version %q: %v", s, err)
 			}
-			if ver != s {
+			if ver != s && ver != "v"+s {
 				t.Errorf("KubernetesReleaseVersion should return same valid version string. %q != %q", s, ver)
 			}
 		})
@@ -195,17 +198,16 @@ func TestSplitVersion(t *testing.T) {
 		{"release/v1.7.0", "https://dl.k8s.io/release", "v1.7.0", true},
 		{"release/latest-1.7", "https://dl.k8s.io/release", "latest-1.7", true},
 		// CI builds area
-		{"ci/latest", "https://dl.k8s.io/ci", "latest", true},
-		{"ci/k8s-master", "https://dl.k8s.io/ci", "k8s-master", true},
-		{"ci/latest-1.7", "https://dl.k8s.io/ci", "latest-1.7", true},
+		{"ci/latest", "https://storage.googleapis.com/k8s-release-dev/ci", "latest", true},
+		{"ci/latest-1.7", "https://storage.googleapis.com/k8s-release-dev/ci", "latest-1.7", true},
 		// unknown label in default (release) area: splitVersion validate only areas.
 		{"unknown-1", "https://dl.k8s.io/release", "unknown-1", true},
 		// unknown area, not valid input.
 		{"unknown/latest-1", "", "", false},
+		// invalid input
+		{"", "", "", false},
+		{"ci/", "", "", false},
 	}
-	// kubeReleaseBucketURL can be overridden during network tests, thus ensure
-	// it will contain value corresponding to expected outcome for this unit test
-	kubeReleaseBucketURL = "https://dl.k8s.io"
 
 	for _, tc := range cases {
 		t.Run(fmt.Sprintf("input:%s/label:%s", tc.input, tc.label), func(t *testing.T) {
@@ -236,8 +238,8 @@ func TestKubernetesIsCIVersion(t *testing.T) {
 		{"release/v1.0.0", false},
 		// CI builds
 		{"ci/latest-1", true},
-		{"ci/k8s-master", true},
 		{"ci/v1.9.0-alpha.1.123+acbcbfd53bfa0a", true},
+		{"ci/", false},
 	}
 
 	for _, tc := range cases {
@@ -268,6 +270,7 @@ func TestCIBuildVersion(t *testing.T) {
 		{"ci/v1.9.0-alpha.1.123+acbcbfd53bfa0a", "v1.9.0-alpha.1.123+acbcbfd53bfa0a", true},
 		{"ci/1.9.0-alpha.1.123+acbcbfd53bfa0a", "v1.9.0-alpha.1.123+acbcbfd53bfa0a", true},
 		{"ci/0invalid", "", false},
+		{"0invalid", "", false},
 	}
 
 	for _, tc := range cases {
@@ -386,6 +389,11 @@ func TestKubeadmVersion(t *testing.T) {
 			parsingError: true,
 		},
 		{
+			name:         "invalid version with label and stray dot",
+			input:        "v1.8.0-alpha.2.",
+			parsingError: true,
+		},
+		{
 			name:        "invalid version with label and metadata",
 			input:       "v1.8.0-alpha.2.1231+afabd012389d53a",
 			output:      "v1.8.0-alpha.3",
@@ -479,5 +487,5 @@ func TestValidateStableVersion(t *testing.T) {
 }
 
 func errorFetcher(url string, timeout time.Duration) (string, error) {
-	return "should not make internet calls", fmt.Errorf("should not make internet calls, tried to request url: %s", url)
+	return "should not make internet calls", errors.Errorf("should not make internet calls, tried to request url: %s", url)
 }

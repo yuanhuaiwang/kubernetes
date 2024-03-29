@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -103,10 +104,7 @@ func (g *Cloud) DeleteTPU(ctx context.Context, name, zone string) error {
 		return err
 	}
 	err = getErrorFromTPUOp(op)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // GetTPU returns the Cloud TPU with the specified name in the specified zone.
@@ -126,22 +124,32 @@ func (g *Cloud) ListTPUs(ctx context.Context, zone string) ([]*tpuapi.Node, erro
 	mc := newTPUMetricContext("list", zone)
 
 	parent := getTPUParentName(g.projectID, zone)
-	response, err := g.tpuService.projects.Locations.Nodes.List(parent).Do()
+	var nodes []*tpuapi.Node
+	var accumulator = func(response *tpuapi.ListNodesResponse) error {
+		nodes = append(nodes, response.Nodes...)
+		return nil
+	}
+	err := g.tpuService.projects.Locations.Nodes.List(parent).Pages(ctx, accumulator)
 	if err != nil {
 		return nil, mc.Observe(err)
 	}
-	return response.Nodes, mc.Observe(nil)
+	return nodes, mc.Observe(nil)
 }
 
 // ListLocations returns the zones where Cloud TPUs are available.
 func (g *Cloud) ListLocations(ctx context.Context) ([]*tpuapi.Location, error) {
 	mc := newTPUMetricContext("list_locations", "")
 	parent := getTPUProjectURL(g.projectID)
-	response, err := g.tpuService.projects.Locations.List(parent).Do()
+	var locations []*tpuapi.Location
+	var accumulator = func(response *tpuapi.ListLocationsResponse) error {
+		locations = append(locations, response.Locations...)
+		return nil
+	}
+	err := g.tpuService.projects.Locations.List(parent).Pages(ctx, accumulator)
 	if err != nil {
 		return nil, mc.Observe(err)
 	}
-	return response.Locations, mc.Observe(nil)
+	return locations, mc.Observe(nil)
 }
 
 // waitForTPUOp checks whether the op is done every 30 seconds before the ctx

@@ -20,20 +20,20 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/apimachinery/pkg/util/clock"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func TestRateLimitingQueue(t *testing.T) {
 	limiter := NewItemExponentialFailureRateLimiter(1*time.Millisecond, 1*time.Second)
 	queue := NewRateLimitingQueue(limiter).(*rateLimitingType)
-	fakeClock := clock.NewFakeClock(time.Now())
+	fakeClock := testingclock.NewFakeClock(time.Now())
 	delayingQueue := &delayingType{
 		Interface:       New(),
 		clock:           fakeClock,
 		heartbeat:       fakeClock.NewTicker(maxWait),
 		stopCh:          make(chan struct{}),
 		waitingForAddCh: make(chan *waitFor, 1000),
-		metrics:         newRetryMetrics(""),
+		metrics:         newRetryMetrics("", nil),
 	}
 	queue.DelayingInterface = delayingQueue
 

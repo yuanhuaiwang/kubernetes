@@ -29,19 +29,17 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 var _ = SIGDescribe("Events", func() {
 	f := framework.NewDefaultFramework("events")
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 
-	/*
-		Release : v1.9
-		Testname: Pod events, verify event from Scheduler and Kubelet
-		Description: Create a Pod, make sure that the Pod can be queried. Create a event selector for the kind=Pod and the source is the Scheduler. List of the events MUST be at least one. Create a event selector for kind=Pod and the source is the Kubelet. List of the events MUST be at least one. Both Scheduler and Kubelet MUST send events when scheduling and running a Pod.
-	*/
-	framework.ConformanceIt("should be sent by kubelets and the scheduler about pods scheduling and running ", func() {
+	ginkgo.It("should be sent by kubelets and the scheduler about pods scheduling and running ", func(ctx context.Context) {
 
 		podClient := f.ClientSet.CoreV1().Pods(f.Namespace.Name)
 
@@ -69,24 +67,25 @@ var _ = SIGDescribe("Events", func() {
 		}
 
 		ginkgo.By("submitting the pod to kubernetes")
-		defer func() {
+		ginkgo.DeferCleanup(func(ctx context.Context) error {
 			ginkgo.By("deleting the pod")
-			podClient.Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
-		}()
-		if _, err := podClient.Create(context.TODO(), pod, metav1.CreateOptions{}); err != nil {
+			return podClient.Delete(ctx, pod.Name, metav1.DeleteOptions{})
+		})
+		if _, err := podClient.Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 			framework.Failf("Failed to create pod: %v", err)
 		}
 
-		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(f.ClientSet, pod.Name, f.Namespace.Name))
+		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name))
 
 		ginkgo.By("verifying the pod is in kubernetes")
 		selector := labels.SelectorFromSet(labels.Set(map[string]string{"time": value}))
 		options := metav1.ListOptions{LabelSelector: selector.String()}
-		pods, err := podClient.List(context.TODO(), options)
-		framework.ExpectEqual(len(pods.Items), 1)
+		pods, err := podClient.List(ctx, options)
+		framework.ExpectNoError(err)
+		gomega.Expect(pods.Items).To(gomega.HaveLen(1))
 
 		ginkgo.By("retrieving the pod")
-		podWithUID, err := podClient.Get(context.TODO(), pod.Name, metav1.GetOptions{})
+		podWithUID, err := podClient.Get(ctx, pod.Name, metav1.GetOptions{})
 		if err != nil {
 			framework.Failf("Failed to get pod: %v", err)
 		}
@@ -94,7 +93,7 @@ var _ = SIGDescribe("Events", func() {
 		var events *v1.EventList
 		// Check for scheduler event about the pod.
 		ginkgo.By("checking for scheduler event about the pod")
-		framework.ExpectNoError(wait.Poll(time.Second*2, time.Second*60, func() (bool, error) {
+		framework.ExpectNoError(wait.Poll(framework.Poll, 5*time.Minute, func() (bool, error) {
 			selector := fields.Set{
 				"involvedObject.kind":      "Pod",
 				"involvedObject.uid":       string(podWithUID.UID),
@@ -102,7 +101,7 @@ var _ = SIGDescribe("Events", func() {
 				"source":                   v1.DefaultSchedulerName,
 			}.AsSelector().String()
 			options := metav1.ListOptions{FieldSelector: selector}
-			events, err := f.ClientSet.CoreV1().Events(f.Namespace.Name).List(context.TODO(), options)
+			events, err := f.ClientSet.CoreV1().Events(f.Namespace.Name).List(ctx, options)
 			if err != nil {
 				return false, err
 			}
@@ -114,7 +113,7 @@ var _ = SIGDescribe("Events", func() {
 		}))
 		// Check for kubelet event about the pod.
 		ginkgo.By("checking for kubelet event about the pod")
-		framework.ExpectNoError(wait.Poll(time.Second*2, time.Second*60, func() (bool, error) {
+		framework.ExpectNoError(wait.Poll(framework.Poll, 5*time.Minute, func() (bool, error) {
 			selector := fields.Set{
 				"involvedObject.uid":       string(podWithUID.UID),
 				"involvedObject.kind":      "Pod",
@@ -122,7 +121,7 @@ var _ = SIGDescribe("Events", func() {
 				"source":                   "kubelet",
 			}.AsSelector().String()
 			options := metav1.ListOptions{FieldSelector: selector}
-			events, err = f.ClientSet.CoreV1().Events(f.Namespace.Name).List(context.TODO(), options)
+			events, err = f.ClientSet.CoreV1().Events(f.Namespace.Name).List(ctx, options)
 			if err != nil {
 				return false, err
 			}

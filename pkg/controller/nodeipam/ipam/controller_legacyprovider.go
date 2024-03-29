@@ -1,3 +1,4 @@
+//go:build !providerless
 // +build !providerless
 
 /*
@@ -19,21 +20,24 @@ limitations under the License.
 package ipam
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
+	netutils "k8s.io/utils/net"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	informers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/kubernetes/pkg/controller/nodeipam/ipam/cidrset"
 	nodesync "k8s.io/kubernetes/pkg/controller/nodeipam/ipam/sync"
-	nodeutil "k8s.io/kubernetes/pkg/controller/util/node"
+	controllerutil "k8s.io/kubernetes/pkg/controller/util/node"
 	"k8s.io/legacy-cloud-providers/gce"
 )
 
@@ -63,6 +67,7 @@ type Controller struct {
 
 // NewController returns a new instance of the IPAM controller.
 func NewController(
+	ctx context.Context,
 	config *Config,
 	kubeClient clientset.Interface,
 	cloud cloudprovider.Interface,
@@ -85,7 +90,7 @@ func NewController(
 
 	c := &Controller{
 		config:  config,
-		adapter: newAdapter(kubeClient, gceCloud),
+		adapter: newAdapter(ctx, kubeClient, gceCloud),
 		syncers: make(map[string]*nodesync.NodeSync),
 		set:     set,
 	}
@@ -110,21 +115,21 @@ func NewController(
 // Start initializes the Controller with the existing list of nodes and
 // registers the informers for node changes. This will start synchronization
 // of the node and cloud CIDR range allocations.
-func (c *Controller) Start(nodeInformer informers.NodeInformer) error {
-	klog.V(0).Infof("Starting IPAM controller (config=%+v)", c.config)
+func (c *Controller) Start(logger klog.Logger, nodeInformer informers.NodeInformer) error {
+	logger.Info("Starting IPAM controller", "config", c.config)
 
-	nodes, err := listNodes(c.adapter.k8s)
+	nodes, err := listNodes(logger, c.adapter.k8s)
 	if err != nil {
 		return err
 	}
 	for _, node := range nodes.Items {
 		if node.Spec.PodCIDR != "" {
-			_, cidrRange, err := net.ParseCIDR(node.Spec.PodCIDR)
+			_, cidrRange, err := netutils.ParseCIDRSloppy(node.Spec.PodCIDR)
 			if err == nil {
 				c.set.Occupy(cidrRange)
-				klog.V(3).Infof("Occupying CIDR for node %q (%v)", node.Name, node.Spec.PodCIDR)
+				logger.V(3).Info("Occupying CIDR for node", "CIDR", node.Spec.PodCIDR, "node", klog.KObj(&node))
 			} else {
-				klog.Errorf("Node %q has an invalid CIDR (%q): %v", node.Name, node.Spec.PodCIDR, err)
+				logger.Error(err, "Node has an invalid CIDR", "node", klog.KObj(&node), "CIDR", node.Spec.PodCIDR)
 			}
 		}
 
@@ -135,28 +140,30 @@ func (c *Controller) Start(nodeInformer informers.NodeInformer) error {
 			// XXX/bowei -- stagger the start of each sync cycle.
 			syncer := c.newSyncer(node.Name)
 			c.syncers[node.Name] = syncer
-			go syncer.Loop(nil)
+			go syncer.Loop(logger, nil)
 		}()
 	}
 
 	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    nodeutil.CreateAddNodeHandler(c.onAdd),
-		UpdateFunc: nodeutil.CreateUpdateNodeHandler(c.onUpdate),
-		DeleteFunc: nodeutil.CreateDeleteNodeHandler(c.onDelete),
+		AddFunc: controllerutil.CreateAddNodeHandler(func(node *v1.Node) error {
+			return c.onAdd(logger, node)
+		}),
+		UpdateFunc: controllerutil.CreateUpdateNodeHandler(func(_, newNode *v1.Node) error {
+			return c.onUpdate(logger, newNode)
+		}),
+		DeleteFunc: controllerutil.CreateDeleteNodeHandler(logger, func(node *v1.Node) error {
+			return c.onDelete(logger, node)
+		}),
 	})
 
 	return nil
 }
 
-// occupyServiceCIDR removes the service CIDR range from the cluster CIDR if it
-// intersects.
-func occupyServiceCIDR(set *cidrset.CidrSet, clusterCIDR, serviceCIDR *net.IPNet) error {
-	if clusterCIDR.Contains(serviceCIDR.IP) || serviceCIDR.Contains(clusterCIDR.IP) {
-		if err := set.Occupy(serviceCIDR); err != nil {
-			return err
-		}
-	}
-	return nil
+func (c *Controller) Run(ctx context.Context) {
+	defer utilruntime.HandleCrash()
+
+	go c.adapter.Run(ctx)
+	<-ctx.Done()
 }
 
 type nodeState struct {
@@ -182,7 +189,7 @@ func (c *Controller) newSyncer(name string) *nodesync.NodeSync {
 	return nodesync.New(ns, c.adapter, c.adapter, c.config.Mode, name, c.set)
 }
 
-func (c *Controller) onAdd(node *v1.Node) error {
+func (c *Controller) onAdd(logger klog.Logger, node *v1.Node) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -190,30 +197,30 @@ func (c *Controller) onAdd(node *v1.Node) error {
 	if !ok {
 		syncer = c.newSyncer(node.Name)
 		c.syncers[node.Name] = syncer
-		go syncer.Loop(nil)
+		go syncer.Loop(logger, nil)
 	} else {
-		klog.Warningf("Add for node %q that already exists", node.Name)
+		logger.Info("Add for node that already exists", "node", klog.KObj(node))
 	}
 	syncer.Update(node)
 
 	return nil
 }
 
-func (c *Controller) onUpdate(_, node *v1.Node) error {
+func (c *Controller) onUpdate(logger klog.Logger, node *v1.Node) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
 	if sync, ok := c.syncers[node.Name]; ok {
 		sync.Update(node)
 	} else {
-		klog.Errorf("Received update for non-existent node %q", node.Name)
+		logger.Error(nil, "Received update for non-existent node", "node", klog.KObj(node))
 		return fmt.Errorf("unknown node %q", node.Name)
 	}
 
 	return nil
 }
 
-func (c *Controller) onDelete(node *v1.Node) error {
+func (c *Controller) onDelete(logger klog.Logger, node *v1.Node) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -221,7 +228,7 @@ func (c *Controller) onDelete(node *v1.Node) error {
 		syncer.Delete(node)
 		delete(c.syncers, node.Name)
 	} else {
-		klog.Warningf("Node %q was already deleted", node.Name)
+		logger.Info("Node was already deleted", "node", klog.KObj(node))
 	}
 
 	return nil

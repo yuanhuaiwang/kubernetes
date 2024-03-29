@@ -27,7 +27,6 @@ import (
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
-	api "k8s.io/kubernetes/pkg/apis/core"
 	_ "k8s.io/kubernetes/pkg/apis/extensions/install"
 	"k8s.io/kubernetes/pkg/apis/networking"
 	_ "k8s.io/kubernetes/pkg/apis/networking/install"
@@ -54,13 +53,13 @@ var (
 	name                = "foo-ingress"
 	defaultHostname     = "foo.bar.com"
 	defaultBackendName  = "default-backend"
-	defaultBackendPort  = intstr.FromInt(80)
+	defaultBackendPort  = intstr.FromInt32(80)
 	defaultLoadBalancer = "127.0.0.1"
 	defaultPath         = "/foo"
 	defaultPathType     = networking.PathTypeImplementationSpecific
 	defaultPathMap      = map[string]string{defaultPath: defaultBackendName}
 	defaultTLS          = []networking.IngressTLS{
-		{Hosts: []string{"foo.bar.com", "*.bar.com"}, SecretName: "fooSecret"},
+		{Hosts: []string{"foo.bar.com", "*.bar.com"}, SecretName: "foosecret"},
 	}
 	serviceBackend = &networking.IngressServiceBackend{
 		Name: "defaultbackend",
@@ -124,8 +123,8 @@ func newIngress(pathMap map[string]string) *networking.Ingress {
 			TLS: defaultTLS,
 		},
 		Status: networking.IngressStatus{
-			LoadBalancer: api.LoadBalancerStatus{
-				Ingress: []api.LoadBalancerIngress{
+			LoadBalancer: networking.IngressLoadBalancerStatus{
+				Ingress: []networking.IngressLoadBalancerIngress{
 					{IP: defaultLoadBalancer},
 				},
 			},
@@ -173,7 +172,7 @@ func TestUpdate(t *testing.T) {
 			})
 			object.Spec.TLS = append(object.Spec.TLS, networking.IngressTLS{
 				Hosts:      []string{"*.google.com"},
-				SecretName: "googleSecret",
+				SecretName: "googlesecret",
 			})
 			return object
 		},

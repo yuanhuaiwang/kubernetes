@@ -19,8 +19,6 @@ package editor
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -142,7 +140,7 @@ func (e Editor) Launch(path string) error {
 // the contents of the file after launch, any errors that occur, and the path of the
 // temporary file so the caller can clean it up as needed.
 func (e Editor) LaunchTempFile(prefix, suffix string, r io.Reader) ([]byte, string, error) {
-	f, err := tempFile(prefix, suffix)
+	f, err := os.CreateTemp("", prefix+"*"+suffix)
 	if err != nil {
 		return nil, "", err
 	}
@@ -157,32 +155,8 @@ func (e Editor) LaunchTempFile(prefix, suffix string, r io.Reader) ([]byte, stri
 	if err := e.Launch(path); err != nil {
 		return nil, path, err
 	}
-	bytes, err := ioutil.ReadFile(path)
+	bytes, err := os.ReadFile(path)
 	return bytes, path, err
-}
-
-func tempFile(prefix, suffix string) (f *os.File, err error) {
-	dir := os.TempDir()
-
-	for i := 0; i < 10000; i++ {
-		name := filepath.Join(dir, prefix+randSeq(5)+suffix)
-		f, err = os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
-		if os.IsExist(err) {
-			continue
-		}
-		break
-	}
-	return
-}
-
-var letters = []rune("abcdefghijklmnopqrstuvwxyz0123456789")
-
-func randSeq(n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
 }
 
 func platformize(linux, windows string) string {

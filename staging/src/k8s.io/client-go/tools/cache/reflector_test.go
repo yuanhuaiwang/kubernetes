@@ -17,22 +17,32 @@ limitations under the License.
 package cache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
 	"reflect"
+	goruntime "runtime"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	"github.com/stretchr/testify/require"
+
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/utils/clock"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 var nevererrc chan error
@@ -116,6 +126,26 @@ func TestReflectorResyncChan(t *testing.T) {
 	}
 }
 
+// TestEstablishedWatchStoppedAfterStopCh ensures that
+// an established watch will be closed right after
+// the StopCh was also closed.
+func TestEstablishedWatchStoppedAfterStopCh(t *testing.T) {
+	ctx, ctxCancel := context.WithCancel(context.TODO())
+	ctxCancel()
+	w := watch.NewFake()
+	require.False(t, w.IsStopped())
+
+	// w is stopped when the stopCh is closed
+	target := NewReflector(nil, &v1.Pod{}, nil, 0)
+	err := target.watch(w, ctx.Done(), nil)
+	require.NoError(t, err)
+	require.True(t, w.IsStopped())
+
+	// noop when the w is nil and the ctx is closed
+	err = target.watch(nil, ctx.Done(), nil)
+	require.NoError(t, err)
+}
+
 func BenchmarkReflectorResyncChanMany(b *testing.B) {
 	s := NewStore(MetaNamespaceKeyFunc)
 	g := NewReflector(&testLW{}, &v1.Pod{}, s, 25*time.Millisecond)
@@ -135,8 +165,7 @@ func TestReflectorWatchHandlerError(t *testing.T) {
 	go func() {
 		fw.Stop()
 	}()
-	var resumeRV string
-	err := g.watchHandler(time.Now(), fw, &resumeRV, nevererrc, wait.NeverStop)
+	err := watchHandler(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, nil, g.clock, nevererrc, wait.NeverStop)
 	if err == nil {
 		t.Errorf("unexpected non-error")
 	}
@@ -155,8 +184,7 @@ func TestReflectorWatchHandler(t *testing.T) {
 		fw.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "baz", ResourceVersion: "32"}})
 		fw.Stop()
 	}()
-	var resumeRV string
-	err := g.watchHandler(time.Now(), fw, &resumeRV, nevererrc, wait.NeverStop)
+	err := watchHandler(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, nil, g.clock, nevererrc, wait.NeverStop)
 	if err != nil {
 		t.Errorf("unexpected error %v", err)
 	}
@@ -188,7 +216,7 @@ func TestReflectorWatchHandler(t *testing.T) {
 	}
 
 	// RV should send the last version we see.
-	if e, a := "32", resumeRV; e != a {
+	if e, a := "32", g.LastSyncResourceVersion(); e != a {
 		t.Errorf("expected %v, got %v", e, a)
 	}
 
@@ -202,10 +230,9 @@ func TestReflectorStopWatch(t *testing.T) {
 	s := NewStore(MetaNamespaceKeyFunc)
 	g := NewReflector(&testLW{}, &v1.Pod{}, s, 0)
 	fw := watch.NewFake()
-	var resumeRV string
 	stopWatch := make(chan struct{}, 1)
 	stopWatch <- struct{}{}
-	err := g.watchHandler(time.Now(), fw, &resumeRV, nevererrc, stopWatch)
+	err := watchHandler(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, nil, g.clock, nevererrc, stopWatch)
 	if err != errorStopRequested {
 		t.Errorf("expected stop error, got %q", err)
 	}
@@ -355,6 +382,208 @@ func TestReflectorListAndWatchWithErrors(t *testing.T) {
 		}
 		r := NewReflector(lw, &v1.Pod{}, s, 0)
 		r.ListAndWatch(wait.NeverStop)
+	}
+}
+
+func TestReflectorListAndWatchInitConnBackoff(t *testing.T) {
+	maxBackoff := 50 * time.Millisecond
+	table := []struct {
+		numConnFails  int
+		expLowerBound time.Duration
+		expUpperBound time.Duration
+	}{
+		{5, 32 * time.Millisecond, 64 * time.Millisecond}, // case where maxBackoff is not hit, time should grow exponentially
+		{40, 35 * 2 * maxBackoff, 40 * 2 * maxBackoff},    // case where maxBoff is hit, backoff time should flatten
+
+	}
+	for _, test := range table {
+		t.Run(fmt.Sprintf("%d connection failures takes at least %d ms", test.numConnFails, 1<<test.numConnFails),
+			func(t *testing.T) {
+				stopCh := make(chan struct{})
+				connFails := test.numConnFails
+				fakeClock := testingclock.NewFakeClock(time.Unix(0, 0))
+				bm := wait.NewExponentialBackoffManager(time.Millisecond, maxBackoff, 100*time.Millisecond, 2.0, 1.0, fakeClock)
+				done := make(chan struct{})
+				defer close(done)
+				go func() {
+					i := 0
+					for {
+						select {
+						case <-done:
+							return
+						default:
+						}
+						if fakeClock.HasWaiters() {
+							step := (1 << (i + 1)) * time.Millisecond
+							if step > maxBackoff*2 {
+								step = maxBackoff * 2
+							}
+							fakeClock.Step(step)
+							i++
+						}
+						time.Sleep(100 * time.Microsecond)
+					}
+				}()
+				lw := &testLW{
+					WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+						if connFails > 0 {
+							connFails--
+							return nil, syscall.ECONNREFUSED
+						}
+						close(stopCh)
+						return watch.NewFake(), nil
+					},
+					ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+						return &v1.PodList{ListMeta: metav1.ListMeta{ResourceVersion: "1"}}, nil
+					},
+				}
+				r := &Reflector{
+					name:              "test-reflector",
+					listerWatcher:     lw,
+					store:             NewFIFO(MetaNamespaceKeyFunc),
+					backoffManager:    bm,
+					clock:             fakeClock,
+					watchErrorHandler: WatchErrorHandler(DefaultWatchErrorHandler),
+				}
+				start := fakeClock.Now()
+				err := r.ListAndWatch(stopCh)
+				elapsed := fakeClock.Since(start)
+				if err != nil {
+					t.Errorf("unexpected error %v", err)
+				}
+				if elapsed < (test.expLowerBound) {
+					t.Errorf("expected lower bound of ListAndWatch: %v, got %v", test.expLowerBound, elapsed)
+				}
+				if elapsed > (test.expUpperBound) {
+					t.Errorf("expected upper bound of ListAndWatch: %v, got %v", test.expUpperBound, elapsed)
+				}
+			})
+	}
+}
+
+type fakeBackoff struct {
+	clock clock.Clock
+	calls int
+}
+
+func (f *fakeBackoff) Backoff() clock.Timer {
+	f.calls++
+	return f.clock.NewTimer(time.Duration(0))
+}
+
+func TestBackoffOnTooManyRequests(t *testing.T) {
+	err := apierrors.NewTooManyRequests("too many requests", 1)
+	clock := &clock.RealClock{}
+	bm := &fakeBackoff{clock: clock}
+
+	lw := &testLW{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return &v1.PodList{ListMeta: metav1.ListMeta{ResourceVersion: "1"}}, nil
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			switch bm.calls {
+			case 0:
+				return nil, err
+			case 1:
+				w := watch.NewFakeWithChanSize(1, false)
+				status := err.Status()
+				w.Error(&status)
+				return w, nil
+			default:
+				w := watch.NewFake()
+				w.Stop()
+				return w, nil
+			}
+		},
+	}
+
+	r := &Reflector{
+		name:              "test-reflector",
+		listerWatcher:     lw,
+		store:             NewFIFO(MetaNamespaceKeyFunc),
+		backoffManager:    bm,
+		clock:             clock,
+		watchErrorHandler: WatchErrorHandler(DefaultWatchErrorHandler),
+	}
+
+	stopCh := make(chan struct{})
+	r.ListAndWatch(stopCh)
+	close(stopCh)
+	if bm.calls != 2 {
+		t.Errorf("unexpected watch backoff calls: %d", bm.calls)
+	}
+}
+
+func TestRetryInternalError(t *testing.T) {
+	testCases := []struct {
+		name                string
+		maxInternalDuration time.Duration
+		rewindTime          int
+		wantRetries         int
+	}{
+		{
+			name:                "retries off",
+			maxInternalDuration: time.Duration(0),
+			wantRetries:         0,
+		},
+		{
+			name:                "retries on, all calls fail",
+			maxInternalDuration: time.Second * 30,
+			wantRetries:         31,
+		},
+		{
+			name:                "retries on, one call successful",
+			maxInternalDuration: time.Second * 30,
+			rewindTime:          10,
+			wantRetries:         40,
+		},
+	}
+
+	for _, tc := range testCases {
+		err := apierrors.NewInternalError(fmt.Errorf("etcdserver: no leader"))
+		fakeClock := testingclock.NewFakeClock(time.Now())
+		bm := &fakeBackoff{clock: fakeClock}
+
+		counter := 0
+
+		lw := &testLW{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				return &v1.PodList{ListMeta: metav1.ListMeta{ResourceVersion: "1"}}, nil
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				counter = counter + 1
+				t.Logf("Counter: %v", counter)
+				if counter == tc.rewindTime {
+					t.Logf("Rewinding")
+					fakeClock.Step(time.Minute)
+				}
+
+				fakeClock.Step(time.Second)
+				w := watch.NewFakeWithChanSize(1, false)
+				status := err.Status()
+				w.Error(&status)
+				return w, nil
+			},
+		}
+
+		r := &Reflector{
+			name:              "test-reflector",
+			listerWatcher:     lw,
+			store:             NewFIFO(MetaNamespaceKeyFunc),
+			backoffManager:    bm,
+			clock:             fakeClock,
+			watchErrorHandler: WatchErrorHandler(DefaultWatchErrorHandler),
+		}
+
+		r.MaxInternalErrorRetryDuration = tc.maxInternalDuration
+
+		stopCh := make(chan struct{})
+		r.ListAndWatch(stopCh)
+		close(stopCh)
+
+		if counter-1 != tc.wantRetries {
+			t.Errorf("%v unexpected number of retries: %d", tc, counter-1)
+		}
 	}
 }
 
@@ -681,7 +910,6 @@ func TestReflectorFullListIfExpired(t *testing.T) {
 				t.Error(err)
 				return nil, err
 			}
-			return nil, nil
 		},
 	}
 	r := NewReflector(lw, &v1.Pod{}, s, 0)
@@ -718,6 +946,7 @@ func TestReflectorFullListIfTooLarge(t *testing.T) {
 	stopCh := make(chan struct{})
 	s := NewStore(MetaNamespaceKeyFunc)
 	listCallRVs := []string{}
+	version := 30
 
 	lw := &testLW{
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
@@ -728,6 +957,7 @@ func TestReflectorFullListIfTooLarge(t *testing.T) {
 		},
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 			listCallRVs = append(listCallRVs, options.ResourceVersion)
+			resourceVersion := strconv.Itoa(version)
 
 			switch options.ResourceVersion {
 			// initial list
@@ -738,9 +968,19 @@ func TestReflectorFullListIfTooLarge(t *testing.T) {
 				err := apierrors.NewTimeoutError("too large resource version", 1)
 				err.ErrStatus.Details.Causes = []metav1.StatusCause{{Type: metav1.CauseTypeResourceVersionTooLarge}}
 				return nil, err
+			// relist after the initial list (covers the error format used in api server 1.17.0-1.18.5)
+			case "30":
+				err := apierrors.NewTimeoutError("too large resource version", 1)
+				err.ErrStatus.Details.Causes = []metav1.StatusCause{{Message: "Too large resource version"}}
+				return nil, err
+			// relist after the initial list (covers the error format used in api server before 1.17.0)
+			case "40":
+				err := apierrors.NewTimeoutError("Too large resource version", 1)
+				return nil, err
 			// relist from etcd after "too large" error
 			case "":
-				return &v1.PodList{ListMeta: metav1.ListMeta{ResourceVersion: "10"}}, nil
+				version += 10
+				return &v1.PodList{ListMeta: metav1.ListMeta{ResourceVersion: resourceVersion}}, nil
 			default:
 				return nil, fmt.Errorf("unexpected List call: %s", options.ResourceVersion)
 			}
@@ -759,18 +999,21 @@ func TestReflectorFullListIfTooLarge(t *testing.T) {
 	// may be synced to a different version and they will never converge.
 	// TODO: We should use etcd progress-notify feature to avoid this behavior but until this is
 	// done we simply try to relist from now to avoid continuous errors on relists.
-	stopCh = make(chan struct{})
-	if err := r.ListAndWatch(stopCh); err != nil {
-		t.Fatal(err)
+	for i := 1; i <= 3; i++ {
+		// relist twice to cover the two variants of TooLargeResourceVersion api errors
+		stopCh = make(chan struct{})
+		if err := r.ListAndWatch(stopCh); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	expectedRVs := []string{"0", "20", ""}
+	expectedRVs := []string{"0", "20", "", "30", "", "40", ""}
 	if !reflect.DeepEqual(listCallRVs, expectedRVs) {
 		t.Errorf("Expected series of list calls with resource version of %#v but got: %#v", expectedRVs, listCallRVs)
 	}
 }
 
-func TestReflectorSetExpectedType(t *testing.T) {
+func TestGetTypeDescriptionFromObject(t *testing.T) {
 	obj := &unstructured.Unstructured{}
 	gvk := schema.GroupVersionKind{
 		Group:   "mygroup",
@@ -778,49 +1021,618 @@ func TestReflectorSetExpectedType(t *testing.T) {
 		Kind:    "MyKind",
 	}
 	obj.SetGroupVersionKind(gvk)
+
 	testCases := map[string]struct {
-		inputType        interface{}
-		expectedTypeName string
-		expectedType     reflect.Type
-		expectedGVK      *schema.GroupVersionKind
+		inputType               interface{}
+		expectedTypeDescription string
 	}{
 		"Nil type": {
-			expectedTypeName: defaultExpectedTypeName,
+			expectedTypeDescription: defaultExpectedTypeName,
 		},
 		"Normal type": {
-			inputType:        &v1.Pod{},
-			expectedTypeName: "*v1.Pod",
-			expectedType:     reflect.TypeOf(&v1.Pod{}),
+			inputType:               &v1.Pod{},
+			expectedTypeDescription: "*v1.Pod",
 		},
 		"Unstructured type without GVK": {
-			inputType:        &unstructured.Unstructured{},
-			expectedTypeName: "*unstructured.Unstructured",
-			expectedType:     reflect.TypeOf(&unstructured.Unstructured{}),
+			inputType:               &unstructured.Unstructured{},
+			expectedTypeDescription: "*unstructured.Unstructured",
 		},
 		"Unstructured type with GVK": {
-			inputType:        obj,
-			expectedTypeName: gvk.String(),
-			expectedType:     reflect.TypeOf(&unstructured.Unstructured{}),
-			expectedGVK:      &gvk,
+			inputType:               obj,
+			expectedTypeDescription: gvk.String(),
 		},
 	}
 	for testName, tc := range testCases {
 		t.Run(testName, func(t *testing.T) {
-			r := &Reflector{}
-			r.setExpectedType(tc.inputType)
-			if tc.expectedType != r.expectedType {
-				t.Fatalf("Expected expectedType %v, got %v", tc.expectedType, r.expectedType)
+			typeDescription := getTypeDescriptionFromObject(tc.inputType)
+			if tc.expectedTypeDescription != typeDescription {
+				t.Fatalf("Expected typeDescription %v, got %v", tc.expectedTypeDescription, typeDescription)
 			}
-			if tc.expectedTypeName != r.expectedTypeName {
-				t.Fatalf("Expected expectedTypeName %v, got %v", tc.expectedTypeName, r.expectedTypeName)
-			}
-			gvkNotEqual := (tc.expectedGVK == nil) != (r.expectedGVK == nil)
-			if tc.expectedGVK != nil && r.expectedGVK != nil {
-				gvkNotEqual = *tc.expectedGVK != *r.expectedGVK
+		})
+	}
+}
+
+func TestGetExpectedGVKFromObject(t *testing.T) {
+	obj := &unstructured.Unstructured{}
+	gvk := schema.GroupVersionKind{
+		Group:   "mygroup",
+		Version: "v1",
+		Kind:    "MyKind",
+	}
+	obj.SetGroupVersionKind(gvk)
+
+	testCases := map[string]struct {
+		inputType   interface{}
+		expectedGVK *schema.GroupVersionKind
+	}{
+		"Nil type": {},
+		"Some non Unstructured type": {
+			inputType: &v1.Pod{},
+		},
+		"Unstructured type without GVK": {
+			inputType: &unstructured.Unstructured{},
+		},
+		"Unstructured type with GVK": {
+			inputType:   obj,
+			expectedGVK: &gvk,
+		},
+	}
+	for testName, tc := range testCases {
+		t.Run(testName, func(t *testing.T) {
+			expectedGVK := getExpectedGVKFromObject(tc.inputType)
+			gvkNotEqual := (tc.expectedGVK == nil) != (expectedGVK == nil)
+			if tc.expectedGVK != nil && expectedGVK != nil {
+				gvkNotEqual = *tc.expectedGVK != *expectedGVK
 			}
 			if gvkNotEqual {
-				t.Fatalf("Expected expectedGVK %v, got %v", tc.expectedGVK, r.expectedGVK)
+				t.Fatalf("Expected expectedGVK %v, got %v", tc.expectedGVK, expectedGVK)
 			}
+		})
+	}
+}
+
+type storeWithRV struct {
+	Store
+
+	// resourceVersions tracks values passed by UpdateResourceVersion
+	resourceVersions []string
+}
+
+func (s *storeWithRV) UpdateResourceVersion(resourceVersion string) {
+	s.resourceVersions = append(s.resourceVersions, resourceVersion)
+}
+
+func newStoreWithRV() *storeWithRV {
+	return &storeWithRV{
+		Store: NewStore(MetaNamespaceKeyFunc),
+	}
+}
+
+func TestReflectorResourceVersionUpdate(t *testing.T) {
+	s := newStoreWithRV()
+
+	stopCh := make(chan struct{})
+	fw := watch.NewFake()
+
+	lw := &testLW{
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return fw, nil
+		},
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return &v1.PodList{ListMeta: metav1.ListMeta{ResourceVersion: "10"}}, nil
+		},
+	}
+	r := NewReflector(lw, &v1.Pod{}, s, 0)
+
+	makePod := func(rv string) *v1.Pod {
+		return &v1.Pod{ObjectMeta: metav1.ObjectMeta{ResourceVersion: rv}}
+	}
+
+	go func() {
+		fw.Action(watch.Added, makePod("10"))
+		fw.Action(watch.Modified, makePod("20"))
+		fw.Action(watch.Bookmark, makePod("30"))
+		fw.Action(watch.Deleted, makePod("40"))
+		close(stopCh)
+	}()
+
+	// Initial list should use RV=0
+	if err := r.ListAndWatch(stopCh); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedRVs := []string{"10", "20", "30", "40"}
+	if !reflect.DeepEqual(s.resourceVersions, expectedRVs) {
+		t.Errorf("Expected series of resource version updates of %#v but got: %#v", expectedRVs, s.resourceVersions)
+	}
+}
+
+const (
+	fakeItemsNum      = 100
+	exemptObjectIndex = fakeItemsNum / 4
+	pageNum           = 3
+)
+
+func getPodListItems(start int, numItems int) (string, string, *v1.PodList) {
+	out := &v1.PodList{
+		Items: make([]v1.Pod, numItems),
+	}
+
+	for i := 0; i < numItems; i++ {
+
+		out.Items[i] = v1.Pod{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "v1",
+				Kind:       "Pod",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("pod-%d", i+start),
+				Namespace: "default",
+				Labels: map[string]string{
+					"label-key-1": "label-value-1",
+				},
+				Annotations: map[string]string{
+					"annotations-key-1": "annotations-value-1",
+				},
+			},
+			Spec: v1.PodSpec{
+				Overhead: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("3"),
+					v1.ResourceMemory: resource.MustParse("8"),
+				},
+				NodeSelector: map[string]string{
+					"foo": "bar",
+					"baz": "quux",
+				},
+				Affinity: &v1.Affinity{
+					NodeAffinity: &v1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+							NodeSelectorTerms: []v1.NodeSelectorTerm{
+								{MatchExpressions: []v1.NodeSelectorRequirement{{Key: `foo`}}},
+							},
+						},
+						PreferredDuringSchedulingIgnoredDuringExecution: []v1.PreferredSchedulingTerm{
+							{Preference: v1.NodeSelectorTerm{MatchExpressions: []v1.NodeSelectorRequirement{{Key: `foo`}}}},
+						},
+					},
+				},
+				TopologySpreadConstraints: []v1.TopologySpreadConstraint{
+					{TopologyKey: `foo`},
+				},
+				HostAliases: []v1.HostAlias{
+					{IP: "1.1.1.1"},
+					{IP: "2.2.2.2"},
+				},
+				ImagePullSecrets: []v1.LocalObjectReference{
+					{Name: "secret1"},
+					{Name: "secret2"},
+				},
+				Containers: []v1.Container{
+					{
+						Name:  "foobar",
+						Image: "alpine",
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("1"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("5"),
+							},
+							Limits: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("2"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("10"),
+							},
+						},
+					},
+					{
+						Name:  "foobar2",
+						Image: "alpine",
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("4"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("12"),
+							},
+							Limits: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("8"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("24"),
+							},
+						},
+					},
+				},
+				InitContainers: []v1.Container{
+					{
+						Name:  "small-init",
+						Image: "alpine",
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("1"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("5"),
+							},
+							Limits: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("1"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("5"),
+							},
+						},
+					},
+					{
+						Name:  "big-init",
+						Image: "alpine",
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("40"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("120"),
+							},
+							Limits: v1.ResourceList{
+								v1.ResourceName(v1.ResourceCPU):    resource.MustParse("80"),
+								v1.ResourceName(v1.ResourceMemory): resource.MustParse("240"),
+							},
+						},
+					},
+				},
+				Hostname: fmt.Sprintf("node-%d", i),
+			},
+			Status: v1.PodStatus{
+				Phase: v1.PodRunning,
+				ContainerStatuses: []v1.ContainerStatus{
+					{
+						ContainerID: "docker://numbers",
+						Image:       "alpine",
+						Name:        "foobar",
+						Ready:       false,
+					},
+					{
+						ContainerID: "docker://numbers",
+						Image:       "alpine",
+						Name:        "foobar2",
+						Ready:       false,
+					},
+				},
+				InitContainerStatuses: []v1.ContainerStatus{
+					{
+						ContainerID: "docker://numbers",
+						Image:       "alpine",
+						Name:        "small-init",
+						Ready:       false,
+					},
+					{
+						ContainerID: "docker://numbers",
+						Image:       "alpine",
+						Name:        "big-init",
+						Ready:       false,
+					},
+				},
+				Conditions: []v1.PodCondition{
+					{
+						Type:               v1.PodScheduled,
+						Status:             v1.ConditionTrue,
+						Reason:             "successfully",
+						Message:            "sync pod successfully",
+						LastProbeTime:      metav1.Now(),
+						LastTransitionTime: metav1.Now(),
+					},
+				},
+			},
+		}
+	}
+
+	return out.Items[0].GetName(), out.Items[exemptObjectIndex].GetName(), out
+}
+
+func getConfigmapListItems(start int, numItems int) (string, string, *v1.ConfigMapList) {
+	out := &v1.ConfigMapList{
+		Items: make([]v1.ConfigMap, numItems),
+	}
+
+	for i := 0; i < numItems; i++ {
+		out.Items[i] = v1.ConfigMap{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "v1",
+				Kind:       "ConfigMap",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("cm-%d", i+start),
+				Namespace: "default",
+				Labels: map[string]string{
+					"label-key-1": "label-value-1",
+				},
+				Annotations: map[string]string{
+					"annotations-key-1": "annotations-value-1",
+				},
+			},
+			Data: map[string]string{
+				"data-1": "value-1",
+				"data-2": "value-2",
+			},
+		}
+	}
+
+	return out.Items[0].GetName(), out.Items[exemptObjectIndex].GetName(), out
+}
+
+type TestPagingPodsLW struct {
+	totalPageCount   int
+	fetchedPageCount int
+
+	detectedObjectNameList []string
+	exemptObjectNameList   []string
+}
+
+func newPageTestLW(totalPageNum int) *TestPagingPodsLW {
+	return &TestPagingPodsLW{
+		totalPageCount:   totalPageNum,
+		fetchedPageCount: 0,
+	}
+}
+
+func (t *TestPagingPodsLW) List(options metav1.ListOptions) (runtime.Object, error) {
+	firstPodName, exemptPodName, list := getPodListItems(t.fetchedPageCount*fakeItemsNum, fakeItemsNum)
+	t.detectedObjectNameList = append(t.detectedObjectNameList, firstPodName)
+	t.exemptObjectNameList = append(t.exemptObjectNameList, exemptPodName)
+	t.fetchedPageCount++
+	if t.fetchedPageCount >= t.totalPageCount {
+		return list, nil
+	}
+	list.SetContinue("true")
+	return list, nil
+}
+
+func (t *TestPagingPodsLW) Watch(options metav1.ListOptions) (watch.Interface, error) {
+	return nil, nil
+}
+
+func TestReflectorListExtract(t *testing.T) {
+	store := NewStore(func(obj interface{}) (string, error) {
+		pod, ok := obj.(*v1.Pod)
+		if !ok {
+			return "", fmt.Errorf("expect *v1.Pod, but got %T", obj)
+		}
+		return pod.GetName(), nil
+	})
+
+	lw := newPageTestLW(5)
+	reflector := NewReflector(lw, &v1.Pod{}, store, 0)
+	reflector.WatchListPageSize = fakeItemsNum
+
+	// execute list to fill store
+	stopCh := make(chan struct{})
+	if err := reflector.list(stopCh); err != nil {
+		t.Fatal(err)
+	}
+
+	// We will not delete exemptPod,
+	// in order to see if the existence of this Pod causes other Pods that are not used to be unable to properly clear.
+	for _, podName := range lw.exemptObjectNameList {
+		_, exist, err := store.GetByKey(podName)
+		if err != nil || !exist {
+			t.Fatalf("%s should exist in pod store", podName)
+		}
+	}
+
+	// we will pay attention to whether the memory occupied by the first Pod is released
+	// Golang's can only be SetFinalizer for the first element of the array,
+	// so pod-0 will be the object of our attention
+	detectedPodAlreadyBeCleared := make(chan struct{}, len(lw.detectedObjectNameList))
+
+	for _, firstPodName := range lw.detectedObjectNameList {
+		_, exist, err := store.GetByKey(firstPodName)
+		if err != nil || !exist {
+			t.Fatalf("%s should exist in pod store", firstPodName)
+		}
+		firstPod, exist, err := store.GetByKey(firstPodName)
+		if err != nil || !exist {
+			t.Fatalf("%s should exist in pod store", firstPodName)
+		}
+		goruntime.SetFinalizer(firstPod, func(obj interface{}) {
+			t.Logf("%s already be gc\n", obj.(*v1.Pod).GetName())
+			detectedPodAlreadyBeCleared <- struct{}{}
+		})
+	}
+
+	storedObjectKeys := store.ListKeys()
+	for _, k := range storedObjectKeys {
+		// delete all Pods except the exempted Pods.
+		if sets.NewString(lw.exemptObjectNameList...).Has(k) {
+			continue
+		}
+		obj, exist, err := store.GetByKey(k)
+		if err != nil || !exist {
+			t.Fatalf("%s should exist in pod store", k)
+		}
+
+		if err := store.Delete(obj); err != nil {
+			t.Fatalf("delete object: %v", err)
+		}
+		goruntime.GC()
+	}
+
+	clearedNum := 0
+	for {
+		select {
+		case <-detectedPodAlreadyBeCleared:
+			clearedNum++
+			if clearedNum == len(lw.detectedObjectNameList) {
+				return
+			}
+		}
+	}
+}
+
+func BenchmarkExtractList(b *testing.B) {
+	_, _, podList := getPodListItems(0, fakeItemsNum)
+	_, _, configMapList := getConfigmapListItems(0, fakeItemsNum)
+	tests := []struct {
+		name string
+		list runtime.Object
+	}{
+		{
+			name: "PodList",
+			list: podList,
+		},
+		{
+			name: "ConfigMapList",
+			list: configMapList,
+		},
+	}
+
+	for _, tc := range tests {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, err := meta.ExtractList(tc.list)
+				if err != nil {
+					b.Errorf("extract list: %v", err)
+				}
+			}
+			b.StopTimer()
+		})
+	}
+}
+
+func BenchmarkEachListItem(b *testing.B) {
+	_, _, podList := getPodListItems(0, fakeItemsNum)
+	_, _, configMapList := getConfigmapListItems(0, fakeItemsNum)
+	tests := []struct {
+		name string
+		list runtime.Object
+	}{
+		{
+			name: "PodList",
+			list: podList,
+		},
+		{
+			name: "ConfigMapList",
+			list: configMapList,
+		},
+	}
+
+	for _, tc := range tests {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				err := meta.EachListItem(tc.list, func(object runtime.Object) error {
+					return nil
+				})
+				if err != nil {
+					b.Errorf("each list: %v", err)
+				}
+			}
+			b.StopTimer()
+		})
+	}
+}
+
+func BenchmarkExtractListWithAlloc(b *testing.B) {
+	_, _, podList := getPodListItems(0, fakeItemsNum)
+	_, _, configMapList := getConfigmapListItems(0, fakeItemsNum)
+	tests := []struct {
+		name string
+		list runtime.Object
+	}{
+		{
+			name: "PodList",
+			list: podList,
+		},
+		{
+			name: "ConfigMapList",
+			list: configMapList,
+		},
+	}
+
+	for _, tc := range tests {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, err := meta.ExtractListWithAlloc(tc.list)
+				if err != nil {
+					b.Errorf("extract list with alloc: %v", err)
+				}
+			}
+			b.StopTimer()
+		})
+	}
+}
+
+func BenchmarkEachListItemWithAlloc(b *testing.B) {
+	_, _, podList := getPodListItems(0, fakeItemsNum)
+	_, _, configMapList := getConfigmapListItems(0, fakeItemsNum)
+	tests := []struct {
+		name string
+		list runtime.Object
+	}{
+		{
+			name: "PodList",
+			list: podList,
+		},
+		{
+			name: "ConfigMapList",
+			list: configMapList,
+		},
+	}
+
+	for _, tc := range tests {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				err := meta.EachListItemWithAlloc(tc.list, func(object runtime.Object) error {
+					return nil
+				})
+				if err != nil {
+					b.Errorf("each list with alloc: %v", err)
+				}
+			}
+			b.StopTimer()
+		})
+	}
+}
+
+func BenchmarkReflectorList(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), wait.ForeverTestTimeout)
+	defer cancel()
+
+	store := NewStore(func(obj interface{}) (string, error) {
+		o, err := meta.Accessor(obj)
+		if err != nil {
+			return "", err
+		}
+		return o.GetName(), nil
+	})
+
+	_, _, podList := getPodListItems(0, fakeItemsNum)
+	_, _, configMapList := getConfigmapListItems(0, fakeItemsNum)
+	tests := []struct {
+		name   string
+		sample func() interface{}
+		list   runtime.Object
+	}{
+		{
+			name: "PodList",
+			sample: func() interface{} {
+				return v1.Pod{}
+			},
+			list: podList,
+		},
+		{
+			name: "ConfigMapList",
+			sample: func() interface{} {
+				return v1.ConfigMap{}
+			},
+			list: configMapList,
+		},
+	}
+
+	for _, tc := range tests {
+		b.Run(tc.name, func(b *testing.B) {
+
+			sample := tc.sample()
+			reflector := NewReflector(newPageTestLW(pageNum), &sample, store, 0)
+			reflector.WatchListPageSize = fakeItemsNum
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				err := reflector.list(ctx.Done())
+				if err != nil {
+					b.Fatalf("reflect list: %v", err)
+				}
+			}
+			b.StopTimer()
 		})
 	}
 }

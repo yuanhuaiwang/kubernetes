@@ -26,7 +26,7 @@ import (
 	"strings"
 
 	"k8s.io/klog/v2"
-	"k8s.io/utils/mount"
+	"k8s.io/mount-utils"
 	utilstrings "k8s.io/utils/strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -73,7 +73,7 @@ func (plugin *cephfsPlugin) CanSupport(spec *volume.Spec) bool {
 	return (spec.Volume != nil && spec.Volume.CephFS != nil) || (spec.PersistentVolume != nil && spec.PersistentVolume.Spec.CephFS != nil)
 }
 
-func (plugin *cephfsPlugin) RequiresRemount() bool {
+func (plugin *cephfsPlugin) RequiresRemount(spec *volume.Spec) bool {
 	return false
 }
 
@@ -83,6 +83,10 @@ func (plugin *cephfsPlugin) SupportsMountOption() bool {
 
 func (plugin *cephfsPlugin) SupportsBulkVolumeVerification() bool {
 	return false
+}
+
+func (plugin *cephfsPlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
+	return false, nil
 }
 
 func (plugin *cephfsPlugin) GetAccessModes() []v1.PersistentVolumeAccessMode {
@@ -103,11 +107,11 @@ func (plugin *cephfsPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, _ volume.
 		// if secret is provideded, retrieve it
 		kubeClient := plugin.host.GetKubeClient()
 		if kubeClient == nil {
-			return nil, fmt.Errorf("Cannot get kube client")
+			return nil, fmt.Errorf("cannot get kube client")
 		}
 		secrets, err := kubeClient.CoreV1().Secrets(secretNs).Get(context.TODO(), secretName, metav1.GetOptions{})
 		if err != nil {
-			err = fmt.Errorf("Couldn't get secret %v/%v err: %v", secretNs, secretName, err)
+			err = fmt.Errorf("couldn't get secret %v/%v err: %w", secretNs, secretName, err)
 			return nil, err
 		}
 		for name, data := range secrets.Data {
@@ -169,7 +173,7 @@ func (plugin *cephfsPlugin) newUnmounterInternal(volName string, podUID types.UI
 	}, nil
 }
 
-func (plugin *cephfsPlugin) ConstructVolumeSpec(volumeName, mountPath string) (*volume.Spec, error) {
+func (plugin *cephfsPlugin) ConstructVolumeSpec(volumeName, mountPath string) (volume.ReconstructedVolume, error) {
 	cephfsVolume := &v1.Volume{
 		Name: volumeName,
 		VolumeSource: v1.VolumeSource{
@@ -179,7 +183,9 @@ func (plugin *cephfsPlugin) ConstructVolumeSpec(volumeName, mountPath string) (*
 			},
 		},
 	}
-	return volume.NewSpecFromVolume(cephfsVolume), nil
+	return volume.ReconstructedVolume{
+		Spec: volume.NewSpecFromVolume(cephfsVolume),
+	}, nil
 }
 
 // CephFS volumes represent a bare host file or directory mount of an CephFS export.
@@ -189,7 +195,7 @@ type cephfs struct {
 	mon        []string
 	path       string
 	id         string
-	secret     string
+	secret     string `datapolicy:"token"`
 	secretFile string
 	readonly   bool
 	mounter    mount.Interface
@@ -206,17 +212,10 @@ var _ volume.Mounter = &cephfsMounter{}
 
 func (cephfsVolume *cephfsMounter) GetAttributes() volume.Attributes {
 	return volume.Attributes{
-		ReadOnly:        cephfsVolume.readonly,
-		Managed:         false,
-		SupportsSELinux: false,
+		ReadOnly:       cephfsVolume.readonly,
+		Managed:        false,
+		SELinuxRelabel: false,
 	}
-}
-
-// Checks prior to mount operations to verify that the required components (binaries, etc.)
-// to mount the volume are available on the underlying node.
-// If not, it returns an error
-func (cephfsVolume *cephfsMounter) CanMount() error {
-	return nil
 }
 
 // SetUp attaches the disk and bind mounts to the volume path.
@@ -347,7 +346,9 @@ func (cephfsVolume *cephfs) execFuseMount(mountpoint string) error {
 		klog.V(4).Info("cephfs mount begin using fuse.")
 
 		keyringPath := cephfsVolume.GetKeyringPath()
-		os.MkdirAll(keyringPath, 0750)
+		if err := os.MkdirAll(keyringPath, 0750); err != nil {
+			return err
+		}
 
 		payload := make(map[string]util.FileProjection, 1)
 		var fileProjection util.FileProjection
@@ -367,7 +368,7 @@ func (cephfsVolume *cephfs) execFuseMount(mountpoint string) error {
 			return err
 		}
 
-		err = writer.Write(payload)
+		err = writer.Write(payload, nil /*setPerms*/)
 		if err != nil {
 			klog.Errorf("failed to write payload to dir: %v", err)
 			return err

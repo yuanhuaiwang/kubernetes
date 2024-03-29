@@ -20,25 +20,36 @@ import (
 	"time"
 
 	fuzz "github.com/google/gofuzz"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+
+	bootstraptokenv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/bootstraptoken/v1"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/output"
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 // Funcs returns the fuzzer functions for the kubeadm apis.
 func Funcs(codecs runtimeserializer.CodecFactory) []interface{} {
 	return []interface{}{
 		fuzzBootstrapToken,
+		fuzzUpgradePlan,
 	}
 }
 
 func fuzzBootstrapToken(obj *output.BootstrapToken, c fuzz.Continue) {
 	c.FuzzNoCustom(obj)
 
-	obj.Token = &kubeadmapiv1beta2.BootstrapTokenString{ID: "uvxdac", Secret: "fq35fuyue3kd4gda"}
+	obj.Token = &bootstraptokenv1.BootstrapTokenString{ID: "uvxdac", Secret: "fq35fuyue3kd4gda"}
 	obj.Description = ""
 	obj.TTL = &metav1.Duration{Duration: time.Hour * 24}
 	obj.Usages = []string{"authentication", "signing"}
-	obj.Groups = []string{"system:bootstrappers:kubeadm:default-node-token"}
+	obj.Groups = []string{constants.NodeBootstrapTokenAuthGroup}
+}
+
+// TODO: Remove this func when v1alpha2 is removed
+func fuzzUpgradePlan(obj *output.UpgradePlan, c fuzz.Continue) {
+	// Pin the value to avoid round tripping the AvailableUpgrades field
+	// which is not present in the v1alpha2 version.
+	obj.AvailableUpgrades = nil
 }

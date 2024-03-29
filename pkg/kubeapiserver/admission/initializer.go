@@ -17,9 +17,10 @@ limitations under the License.
 package admission
 
 import (
-	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
-	quota "k8s.io/kubernetes/pkg/quota/v1"
+	"k8s.io/apiserver/pkg/admission/initializer"
+	quota "k8s.io/apiserver/pkg/quota/v1"
 )
 
 // TODO add a `WantsToRun` which takes a stopCh.  Might make it generic.
@@ -29,22 +30,11 @@ type WantsCloudConfig interface {
 	SetCloudConfig([]byte)
 }
 
-// WantsRESTMapper defines a function which sets RESTMapper for admission plugins that need it.
-type WantsRESTMapper interface {
-	SetRESTMapper(meta.RESTMapper)
-}
-
-// WantsQuotaConfiguration defines a function which sets quota configuration for admission plugins that need it.
-type WantsQuotaConfiguration interface {
-	SetQuotaConfiguration(quota.Configuration)
-	admission.InitializationValidator
-}
-
 // PluginInitializer is used for initialization of the Kubernetes specific admission plugins.
 type PluginInitializer struct {
-	cloudConfig        []byte
-	restMapper         meta.RESTMapper
-	quotaConfiguration quota.Configuration
+	cloudConfig                []byte
+	quotaConfiguration         quota.Configuration
+	excludedAdmissionResources []schema.GroupResource
 }
 
 var _ admission.PluginInitializer = &PluginInitializer{}
@@ -54,13 +44,13 @@ var _ admission.PluginInitializer = &PluginInitializer{}
 // all public, this construction method is pointless boilerplate.
 func NewPluginInitializer(
 	cloudConfig []byte,
-	restMapper meta.RESTMapper,
 	quotaConfiguration quota.Configuration,
+	excludedAdmissionResources []schema.GroupResource,
 ) *PluginInitializer {
 	return &PluginInitializer{
-		cloudConfig:        cloudConfig,
-		restMapper:         restMapper,
-		quotaConfiguration: quotaConfiguration,
+		cloudConfig:                cloudConfig,
+		quotaConfiguration:         quotaConfiguration,
+		excludedAdmissionResources: excludedAdmissionResources,
 	}
 }
 
@@ -71,11 +61,11 @@ func (i *PluginInitializer) Initialize(plugin admission.Interface) {
 		wants.SetCloudConfig(i.cloudConfig)
 	}
 
-	if wants, ok := plugin.(WantsRESTMapper); ok {
-		wants.SetRESTMapper(i.restMapper)
+	if wants, ok := plugin.(initializer.WantsQuotaConfiguration); ok {
+		wants.SetQuotaConfiguration(i.quotaConfiguration)
 	}
 
-	if wants, ok := plugin.(WantsQuotaConfiguration); ok {
-		wants.SetQuotaConfiguration(i.quotaConfiguration)
+	if wants, ok := plugin.(initializer.WantsExcludedAdmissionResources); ok {
+		wants.SetExcludedAdmissionResources(i.excludedAdmissionResources)
 	}
 }
